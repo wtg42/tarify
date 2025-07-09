@@ -10,6 +10,7 @@ const App = struct {
     allocator: std.mem.Allocator,
     argv: []const [:0]u8,
     list: std.ArrayList([]const u8),
+    specify_dir: [:0]u8,
 
     /// 初始化 App 結構。
     ///
@@ -21,6 +22,7 @@ const App = struct {
             .allocator = allocator,
             .argv = argv,
             .list = std.ArrayList([]const u8).init(allocator),
+            .specify_dir = undefined,
         };
     }
 
@@ -70,7 +72,15 @@ const App = struct {
 
             // 取得檔案的狀態 (大小、權限、時間等)
             var st: std.fs.File.Stat = undefined;
-            st = try std.fs.cwd().statFile(path_z);
+            // st = try std.fs.cwd().statFile(path_z);
+            const path_z_dir = try std.fs.openDirAbsolute(path_z, .{
+                .access_sub_paths = true,
+                .iterate = true,
+                .no_follow = true,
+            });
+            defer path_z_dir.close();
+
+            st = try path_z_dir.statFile(path_z);
 
             const entry = c.archive_entry_new();
             if (entry == null) {
@@ -91,7 +101,12 @@ const App = struct {
 
             // 如果是檔案 (不是目錄)，則讀取其內容並寫入存檔
             if (st.kind == .File) {
-                var file = try std.fs.cwd().openFile(path_z, .{});
+                // var file = try std.fs.cwd().openFile(path_z, .{});
+                var file = try std.fs.openDirAbsolute(path_z, .{
+                    .access_sub_paths = true,
+                    .iterate = true,
+                    .no_follow = true,
+                });
                 defer file.close();
 
                 while (try file.read(&buffer)) |bytes_read| {
@@ -117,14 +132,27 @@ const App = struct {
     /// 3. 忽略在 `ignore_files` 列表中的檔案。
     /// 4. 將所有其他檔案的名稱（作為新分配的字串）加入到內部列表中。
     /// 5. 印出最終收集到的檔案名稱列表。
-    pub fn run(self: *App, scan_path: []const u8) !void {
+    pub fn collectFilesRecursively(self: *App, scan_path: []const u8) !void {
+        // Create a variable that specifies current directory path, including subdirectories.
+        // Use to build the full_path_file_name.
+        // [註解] 這裡的 dupe 不是必要的，scan_path 在此函式作用域內已經是有效的，可以省去一次記憶體分配。
+        const base_path: []const u8 = try self.allocator.dupe(u8, scan_path);
+        @breakpoint();
+
         // 清除可能殘留的 .tgz 檔案
-        var dir_clean = try std.fs.cwd().openDir(scan_path, .{ .iterate = true });
+        // var dir_clean = try std.fs.cwd().openDir(scan_path, .{ .iterate = true });
+        var dir_clean = try std.fs.openDirAbsolute(scan_path, .{
+            .iterate = true,
+            .no_follow = true,
+            .access_sub_paths = true,
+        });
         defer dir_clean.close();
+
         var it_clean = dir_clean.iterate();
         while (try it_clean.next()) |entry| {
             if (std.mem.endsWith(u8, entry.name, ".tgz")) {
-                try std.fs.cwd().deleteFile(entry.name);
+                // try std.fs.cwd().deleteFile(entry.name);
+                try dir_clean.deleteFile(entry.name);
                 std.debug.print("remove {s}\n", .{entry.name});
             }
         }
@@ -133,7 +161,12 @@ const App = struct {
         const ignore_files = [_][]const u8{"INSTALL.sh"};
 
         // 開啟當前工作目錄
-        var dir = try std.fs.cwd().openDir(scan_path, .{ .iterate = true });
+        // var dir = try std.fs.cwd().openDir(scan_path, .{ .iterate = true });
+        var dir = try std.fs.openDirAbsolute(scan_path, .{
+            .access_sub_paths = true,
+            .iterate = true,
+            .no_follow = true,
+        });
         defer dir.close();
 
         // 建立目錄迭代器並遍歷所有條目
@@ -156,6 +189,7 @@ const App = struct {
             }
 
             // 如果檔案是目錄，必須遞回掃描內部
+            // entry.name 就是只有 name 你必須自己傳入 base_path 來組合路徑
             if (entry.kind == .directory) {
                 // 1. 忽略 '.' '..' 兩個目錄
                 if (std.mem.eql(u8, entry.name, ".") or std.mem.eql(u8, entry.name, "..")) {
@@ -165,21 +199,45 @@ const App = struct {
                 dumpEntry(entry);
 
                 // 2. 建立正確的遞迴路徑 (例如 "src/test_dir")
-                const new_path = try std.fs.path.join(self.allocator, &.{ scan_path, entry.name });
+                const new_path = try std.fs.path.join(
+                    self.allocator,
+                    &.{ scan_path, entry.name },
+                );
                 defer self.allocator.free(new_path);
 
-                try self.run(new_path);
+                try self.collectFilesRecursively(new_path);
+
+                // Jump to next loop when self.run() is done.
+                continue;
             }
 
-            // 將未被忽略的檔案名稱加入到 list 中
-            // We must duplicate the string, as `entry.name` is a slice of a buffer that will be reused.
-            try self.list.append(try self.allocator.dupe(u8, entry.name));
-        }
+            // 遍歷 list 並印出所有收集到的檔案名稱
+            // Combine base_path and file name.
+            // const full_path_file_name = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{
+            //     base_path,
+            //     entry.name,
+            // });
 
-        // 遍歷 list 並印出所有收集到的檔案名稱
-        for (self.list.items) |item| {
-            std.debug.print("file name in list: {s}\n", .{item});
+            // 遍歷 list 並印出所有收集到的檔案名稱
+            // Combine base_path and file name.
+            const full_path_file_name = try std.fs.path.join(
+                self.allocator,
+                &.{
+                    base_path,
+                    entry.name,
+                },
+            );
+
+            // [註解] 邏輯問題：不論是檔案還是目錄，這裡都會被加入列表。這會導致目錄本身和目錄內的檔案都被重複加入。
+            try self.list.append(try self.allocator.dupe(u8, full_path_file_name));
         }
+    }
+
+    /// Set up the working directory
+    ///
+    /// Don't use cwd() to handle your files -- it's dangerous.
+    fn setTargetWorkingDirectory(self: *App, path: [:0]u8) void {
+        self.specify_dir = path;
     }
 };
 
@@ -196,14 +254,23 @@ pub fn main() !void {
     const argv = try std.process.argsAlloc(gpa.allocator());
     defer std.process.argsFree(gpa.allocator(), argv);
 
-    for (argv, 0..) |value, i| {
-        std.debug.print("argv[{d}]: {s}\n", .{ i, value });
-    }
-
     var app = App.init(gpa.allocator(), argv);
     defer app.deinit();
 
-    try app.run(".");
+    for (argv, 0..) |value, i| {
+        if (i == 1) {
+            // Make sure App.init() has already been called.
+            app.setTargetWorkingDirectory(value);
+        }
+        std.debug.print("argv[{d}]: {s}\n", .{ i, value });
+    }
+
+    // [註解] 風險：如果命令列沒有提供路徑參數，app.specify_dir 會是 undefined，這裡會直接導致程式崩潰。應在使用前增加參數數量檢查。
+    try app.collectFilesRecursively(app.specify_dir);
+
+    for (app.list.items) |item| {
+        std.debug.print("file name in list: {s}\n", .{item});
+    }
 
     // try app.createTarArchive("tarify.tgz");
 }
