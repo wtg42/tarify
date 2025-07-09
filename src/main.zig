@@ -72,7 +72,6 @@ const App = struct {
 
             // 取得檔案的狀態 (大小、權限、時間等)
             var st: std.fs.File.Stat = undefined;
-            // st = try std.fs.cwd().statFile(path_z);
             const path_z_dir = try std.fs.openDirAbsolute(path_z, .{
                 .access_sub_paths = true,
                 .iterate = true,
@@ -101,7 +100,6 @@ const App = struct {
 
             // 如果是檔案 (不是目錄)，則讀取其內容並寫入存檔
             if (st.kind == .File) {
-                // var file = try std.fs.cwd().openFile(path_z, .{});
                 var file = try std.fs.openDirAbsolute(path_z, .{
                     .access_sub_paths = true,
                     .iterate = true,
@@ -137,10 +135,9 @@ const App = struct {
         // Use to build the full_path_file_name.
         // [註解] 這裡的 dupe 不是必要的，scan_path 在此函式作用域內已經是有效的，可以省去一次記憶體分配。
         const base_path: []const u8 = try self.allocator.dupe(u8, scan_path);
-        @breakpoint();
+        defer self.allocator.free(base_path);
 
         // 清除可能殘留的 .tgz 檔案
-        // var dir_clean = try std.fs.cwd().openDir(scan_path, .{ .iterate = true });
         var dir_clean = try std.fs.openDirAbsolute(scan_path, .{
             .iterate = true,
             .no_follow = true,
@@ -161,7 +158,6 @@ const App = struct {
         const ignore_files = [_][]const u8{"INSTALL.sh"};
 
         // 開啟當前工作目錄
-        // var dir = try std.fs.cwd().openDir(scan_path, .{ .iterate = true });
         var dir = try std.fs.openDirAbsolute(scan_path, .{
             .access_sub_paths = true,
             .iterate = true,
@@ -196,7 +192,7 @@ const App = struct {
                     continue;
                 }
                 std.debug.print("directory:{s}\n", .{entry.name});
-                dumpEntry(entry);
+                // dumpEntry(entry);
 
                 // 2. 建立正確的遞迴路徑 (例如 "src/test_dir")
                 const new_path = try std.fs.path.join(
@@ -227,8 +223,9 @@ const App = struct {
                     entry.name,
                 },
             );
+            defer self.allocator.free(full_path_file_name);
 
-            // [註解] 邏輯問題：不論是檔案還是目錄，這裡都會被加入列表。這會導致目錄本身和目錄內的檔案都被重複加入。
+            // 最後把需要的處理的檔名加進去
             try self.list.append(try self.allocator.dupe(u8, full_path_file_name));
         }
     }
