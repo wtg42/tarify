@@ -24,8 +24,8 @@ const App = struct {
             .allocator = allocator,
             .argv = argv,
             .list = std.ArrayList([]const u8).init(allocator),
-            .specify_dir = argv[0],
-            .output_file = argv[1],
+            .specify_dir = argv[1],
+            .output_file = argv[2],
         };
     }
 
@@ -296,7 +296,15 @@ pub fn main() !void {
         std.debug.print("argv[{d}]: {s}\n", .{ i, value });
     }
 
-    std.process.exit(1);
+    // 給使用者看的訊息 ++ 用法
+    std.io.getStdOut().writer().print(
+        "🔧 Starting archive process...\n" ++
+            "📂 Directory to archive: {s}\n" ++
+            "📦 Output file path:     {s}\n",
+        .{ argv[1], argv[2] },
+    ) catch {
+        std.process.exit(9);
+    };
 
     // 開始收集 用戶指定路徑的檔案列表
     try app.collectFilesRecursively(app.specify_dir);
@@ -308,7 +316,7 @@ pub fn main() !void {
     var env = try std.process.getEnvMap(app.allocator);
     defer env.deinit();
 
-    try app.createTarArchive("/home/weiting/patch.tgz");
+    try app.createTarArchive(argv[2]);
 }
 
 /// 目前沒用到 可能會移除掉
