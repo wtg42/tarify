@@ -4,6 +4,7 @@ const std = @import("std");
 const c = @cImport({
     @cInclude("archive.h");
     @cInclude("archive_entry.h");
+    @cInclude("sys/stat.h");
 });
 
 const App = struct {
@@ -11,6 +12,7 @@ const App = struct {
     argv: []const [:0]u8,
     list: std.ArrayList([]const u8),
     specify_dir: [:0]u8,
+    output_file: [:0]u8,
 
     /// 初始化 App 結構。
     ///
@@ -22,7 +24,8 @@ const App = struct {
             .allocator = allocator,
             .argv = argv,
             .list = std.ArrayList([]const u8).init(allocator),
-            .specify_dir = undefined,
+            .specify_dir = argv[0],
+            .output_file = argv[1],
         };
     }
 
@@ -67,19 +70,28 @@ const App = struct {
         // 遍歷要加入存檔的檔案列表
         for (self.list.items) |path| {
             // libarchive 需要一個以 null 結尾的字串
-            const path_z = try self.allocator.dupeZ(u8, path);
-            defer self.allocator.free(path_z);
+            const file_path_z = try self.allocator.dupeZ(u8, path);
+            // const file_path_z = try std.fmt.allocPrintZ(
+            //     self.allocator,
+            //     "./{s}",
+            //     .{path},
+            // );
+
+            defer self.allocator.free(file_path_z);
 
             // 取得檔案的狀態 (大小、權限、時間等)
-            var st: std.fs.File.Stat = undefined;
-            const path_z_dir = try std.fs.openDirAbsolute(path_z, .{
-                .access_sub_paths = true,
-                .iterate = true,
-                .no_follow = true,
-            });
-            defer path_z_dir.close();
+            // const z_file = try std.fs.openFileAbsolute(
+            //     file_path_z,
+            //     .{ .mode = .read_only },
+            // );
+            // defer z_file.close();
 
-            st = try path_z_dir.statFile(path_z);
+            // st = try z_file.stat();
+            var st: c.struct_stat = undefined;
+            if (c.stat(file_path_z, &st) != 0) {
+                std.debug.print("stat failed for {s}\n", .{file_path_z});
+                return error.StatFailed;
+            }
 
             const entry = c.archive_entry_new();
             if (entry == null) {
@@ -88,34 +100,52 @@ const App = struct {
             defer c.archive_entry_free(entry);
 
             // 設定存檔條目的路徑名稱
-            c.archive_entry_set_pathname(entry, path_z);
+            c.archive_entry_set_pathname(entry, file_path_z);
             // 從 stat 結構複製元數據
             c.archive_entry_copy_stat(entry, &st);
 
             // 寫入此檔案的標頭
             if (c.archive_write_header(a, entry) != c.ARCHIVE_OK) {
-                std.debug.print("archive_write_header for {s} failed: {s}\n", .{ path, c.archive_error_string(a) });
+                std.debug.print(
+                    "archive_write_header for {s} failed: {s}\n",
+                    .{ path, c.archive_error_string(a) },
+                );
                 return error.ArchiveHeaderFailed;
             }
 
             // 如果是檔案 (不是目錄)，則讀取其內容並寫入存檔
-            if (st.kind == .File) {
-                var file = try std.fs.openDirAbsolute(path_z, .{
-                    .access_sub_paths = true,
-                    .iterate = true,
-                    .no_follow = true,
-                });
+            // if (st.kind == .File) {
+            if ((st.st_mode & c.S_IFMT) == c.S_IFREG) {
+                var file = try std.fs.openFileAbsolute(
+                    file_path_z,
+                    .{ .mode = .read_only },
+                );
                 defer file.close();
 
-                while (try file.read(&buffer)) |bytes_read| {
-                    if (bytes_read > 0) {
-                        const written = c.archive_write_data(a, &buffer, bytes_read);
-                        if (written < 0) {
-                            std.debug.print("archive_write_data for {s} failed: {s}\n", .{ path, c.archive_error_string(a) });
-                            return error.ArchiveWriteFailed;
-                        }
+                while (true) {
+                    const bytes_read = try file.read(&buffer);
+                    if (bytes_read == 0) break;
+
+                    const written = c.archive_write_data(a, &buffer, bytes_read);
+                    if (written < 0) {
+                        std.debug.print(
+                            "archive_write_data for {s} failed: {s}\n",
+                            .{ path, c.archive_error_string(a) },
+                        );
+
+                        return error.ArchiveWriteFailed;
                     }
                 }
+            }
+
+            // ✅ 即使非必要，建議保留，不然其實 close() 也會自動呼叫
+            if (c.archive_write_finish_entry(a) != c.ARCHIVE_OK) {
+                std.debug.print(
+                    "archive_write_finish_entry failed: {s}\n",
+                    .{c.archive_error_string(a)},
+                );
+
+                return error.ArchiveFinishEntryFailed;
             }
         }
 
@@ -133,7 +163,6 @@ const App = struct {
     pub fn collectFilesRecursively(self: *App, scan_path: []const u8) !void {
         // Create a variable that specifies current directory path, including subdirectories.
         // Use to build the full_path_file_name.
-        // [註解] 這裡的 dupe 不是必要的，scan_path 在此函式作用域內已經是有效的，可以省去一次記憶體分配。
         const base_path: []const u8 = try self.allocator.dupe(u8, scan_path);
         defer self.allocator.free(base_path);
 
@@ -192,7 +221,6 @@ const App = struct {
                     continue;
                 }
                 std.debug.print("directory:{s}\n", .{entry.name});
-                // dumpEntry(entry);
 
                 // 2. 建立正確的遞迴路徑 (例如 "src/test_dir")
                 const new_path = try std.fs.path.join(
@@ -229,13 +257,6 @@ const App = struct {
             try self.list.append(try self.allocator.dupe(u8, full_path_file_name));
         }
     }
-
-    /// Set up the working directory
-    ///
-    /// Don't use cwd() to handle your files -- it's dangerous.
-    fn setTargetWorkingDirectory(self: *App, path: [:0]u8) void {
-        self.specify_dir = path;
-    }
 };
 
 /// 程式進入點。
@@ -251,27 +272,46 @@ pub fn main() !void {
     const argv = try std.process.argsAlloc(gpa.allocator());
     defer std.process.argsFree(gpa.allocator(), argv);
 
+    // 檢查參數數量
+    if (argv.len < 3) {
+        std.debug.print("Usage: {s} <directory_to_archive> <output_file_path>\n", .{argv[0]});
+        return;
+    }
+
+    // debug message
+    for (argv) |value| {
+        std.debug.print("{s}\n", .{value});
+    }
+
     var app = App.init(gpa.allocator(), argv);
     defer app.deinit();
 
+    // Start to set App-ralated fields.
     for (argv, 0..) |value, i| {
-        if (i == 1) {
-            // Make sure App.init() has already been called.
-            app.setTargetWorkingDirectory(value);
+        switch (i) {
+            1 => app.specify_dir = value,
+            2 => app.output_file = value,
+            else => break,
         }
         std.debug.print("argv[{d}]: {s}\n", .{ i, value });
     }
 
-    // [註解] 風險：如果命令列沒有提供路徑參數，app.specify_dir 會是 undefined，這裡會直接導致程式崩潰。應在使用前增加參數數量檢查。
+    std.process.exit(1);
+
+    // 開始收集 用戶指定路徑的檔案列表
     try app.collectFilesRecursively(app.specify_dir);
 
     for (app.list.items) |item| {
         std.debug.print("file name in list: {s}\n", .{item});
     }
 
-    // try app.createTarArchive("tarify.tgz");
+    var env = try std.process.getEnvMap(app.allocator);
+    defer env.deinit();
+
+    try app.createTarArchive("/home/weiting/patch.tgz");
 }
 
+/// 目前沒用到 可能會移除掉
 fn dumpEntry(entry: std.fs.Dir.Entry) void {
     std.debug.print("Entry:\n", .{});
     std.debug.print("  name: {s}\n", .{entry.name});

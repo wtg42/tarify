@@ -87,6 +87,7 @@ pub fn build(b: *std.Build) void {
     // ✨ 在這裡加 include path
     exe.addIncludePath(b.path("third_party/libarchive/libarchive"));
     exe.linkSystemLibrary("archive");
+    exe.linkLibC();
 
     // This declares intent for the executable to be installed into the
     // install prefix when running `zig build` (i.e. when executing the default
