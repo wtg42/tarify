@@ -1,5 +1,5 @@
 /// MSE 專案打包 CLI app
-/// TODO: std.debug.print() 改成 自己包裝的 std.log + write file
+/// TODO: 包裝一個可以把 log 寫到特定 file 的 fn
 const std = @import("std");
 
 // 在 build.zig 裡面設定 libarchive
@@ -13,8 +13,12 @@ const App = struct {
     allocator: std.mem.Allocator,
     argv: []const [:0]u8,
     list: std.ArrayList([]const u8),
+    // 指定要打包的目的，同時也是打包完畢後存放的地方
     specify_dir: [:0]u8,
+    // 打包指定的名稱 例如 project_6244_a1.tgz
     output_file: [:0]u8,
+
+    const sourceCodeArchive = "patch.tgz";
 
     /// 初始化 App 結構。
     ///
@@ -43,27 +47,33 @@ const App = struct {
         self.list.deinit();
     }
 
-    /// 使用 libarchive 建立一個 tar 存檔。
+    /// 使用 libarchive 建立一個 tgz 存檔。
     ///
     /// @param self - App 的實例。
     /// @param out_filename - 輸出的 tar 檔案名稱 (必須是 null-terminated string)。
     pub fn createTarArchive(self: *const App, out_filename: [:0]const u8) !void {
         const a = c.archive_write_new();
         if (a == null) {
-            std.debug.print("archive_write_new failed\n", .{});
+            std.log.info("archive_write_new failed", .{});
             return error.ArchiveCreationFailed;
         }
         defer _ = c.archive_write_free(a);
 
+        // Add a Gzip compression filter.
+        if (c.archive_write_add_filter_gzip(a) != c.ARCHIVE_OK) {
+            std.log.err("archive_write_add_filter_gzip failed: {s}", .{c.archive_error_string(a)});
+            return error.ArchiveFilterFailed;
+        }
+
         // 設定存檔格式為 PAX Restricted (一個現代、可移植的 tar 變體)
         if (c.archive_write_set_format_pax_restricted(a) != c.ARCHIVE_OK) {
-            std.debug.print("archive_write_set_format_pax_restricted failed: {s}\n", .{c.archive_error_string(a)});
+            std.log.info("archive_write_set_format_pax_restricted failed: {s}", .{c.archive_error_string(a)});
             return error.ArchiveFormatFailed;
         }
 
         // 開啟檔案以進行寫入
         if (c.archive_write_open_filename(a, out_filename) != c.ARCHIVE_OK) {
-            std.debug.print("archive_write_open_filename failed: {s}\n", .{c.archive_error_string(a)});
+            std.log.info("archive_write_open_filename failed: {s}", .{c.archive_error_string(a)});
             return error.ArchiveOpenFailed;
         }
         defer _ = c.archive_write_close(a);
@@ -74,25 +84,13 @@ const App = struct {
         for (self.list.items) |path| {
             // libarchive 需要一個以 null 結尾的字串
             const file_path_z = try self.allocator.dupeZ(u8, path);
-            // const file_path_z = try std.fmt.allocPrintZ(
-            //     self.allocator,
-            //     "./{s}",
-            //     .{path},
-            // );
 
             defer self.allocator.free(file_path_z);
 
             // 取得檔案的狀態 (大小、權限、時間等)
-            // const z_file = try std.fs.openFileAbsolute(
-            //     file_path_z,
-            //     .{ .mode = .read_only },
-            // );
-            // defer z_file.close();
-
-            // st = try z_file.stat();
             var st: c.struct_stat = undefined;
             if (c.stat(file_path_z, &st) != 0) {
-                std.debug.print("stat failed for {s}\n", .{file_path_z});
+                std.log.info("stat failed for {s}", .{file_path_z});
                 return error.StatFailed;
             }
 
@@ -109,8 +107,8 @@ const App = struct {
 
             // 寫入此檔案的標頭
             if (c.archive_write_header(a, entry) != c.ARCHIVE_OK) {
-                std.debug.print(
-                    "archive_write_header for {s} failed: {s}\n",
+                std.log.info(
+                    "archive_write_header for {s} failed: {s}",
                     .{ path, c.archive_error_string(a) },
                 );
                 return error.ArchiveHeaderFailed;
@@ -130,8 +128,8 @@ const App = struct {
 
                     const written = c.archive_write_data(a, &buffer, bytes_read);
                     if (written < 0) {
-                        std.debug.print(
-                            "archive_write_data for {s} failed: {s}\n",
+                        std.log.info(
+                            "archive_write_data for {s} failed: {s}",
                             .{ path, c.archive_error_string(a) },
                         );
 
@@ -142,8 +140,8 @@ const App = struct {
 
             // ✅ 即使非必要，建議保留，不然其實 close() 也會自動呼叫
             if (c.archive_write_finish_entry(a) != c.ARCHIVE_OK) {
-                std.debug.print(
-                    "archive_write_finish_entry failed: {s}\n",
+                std.log.info(
+                    "archive_write_finish_entry failed: {s}",
                     .{c.archive_error_string(a)},
                 );
 
@@ -151,7 +149,7 @@ const App = struct {
             }
         }
 
-        std.debug.print("Successfully created tar archive: '{s}'\n", .{out_filename});
+        std.log.info("Successfully created tar archive: '{s}'", .{out_filename});
     }
 
     /// 執行應用程式的主要邏輯。
@@ -181,14 +179,14 @@ const App = struct {
             if (std.mem.endsWith(u8, entry.name, ".tgz")) {
                 // try std.fs.cwd().deleteFile(entry.name);
                 try dir_clean.deleteFile(entry.name);
-                std.debug.print("remove {s}\n", .{entry.name});
+                std.log.info("remove {s}", .{entry.name});
             }
         }
 
         // 定義要忽略的檔案列表
         const ignore_files = [_][]const u8{"INSTALL.sh"};
 
-        // 開啟當前工作目錄
+        // 開啟指定作目錄
         var dir = try std.fs.openDirAbsolute(scan_path, .{
             .access_sub_paths = true,
             .iterate = true,
@@ -199,7 +197,7 @@ const App = struct {
         // 建立目錄迭代器並遍歷所有條目
         var it = dir.iterate();
         while (try it.next()) |entry| {
-            std.debug.print("origin file name: {s}\n", .{entry.name});
+            std.log.info("origin file name: {s}", .{entry.name});
 
             // 檢查檔案是否在忽略清單中
             var is_ignored = false;
@@ -222,7 +220,7 @@ const App = struct {
                 if (std.mem.eql(u8, entry.name, ".") or std.mem.eql(u8, entry.name, "..")) {
                     continue;
                 }
-                std.debug.print("directory:{s}\n", .{entry.name});
+                std.log.info("directory:{s}", .{entry.name});
 
                 // 2. 建立正確的遞迴路徑 (例如 "src/test_dir")
                 const new_path = try std.fs.path.join(
@@ -261,73 +259,6 @@ const App = struct {
     }
 };
 
-/// 程式進入點。
-///
-/// 負責設定記憶體分配器、處理命令列參數、初始化 App 結構，
-/// 執行主要邏輯，並確保所有分配的資源都被正確釋放。
-pub fn main() !void {
-    // 先取得用戶的 argv
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-
-    // 取得用戶的 argv
-    const argv = try std.process.argsAlloc(gpa.allocator());
-    defer std.process.argsFree(gpa.allocator(), argv);
-
-    // 檢查參數數量
-    if (argv.len < 3) {
-        std.debug.print("Usage: {s} <directory_to_archive> <output_file_path>\n", .{argv[0]});
-        return;
-    }
-
-    // Validate argv[2].
-    if (!try valiateOutFileName(argv[2])) {
-        // valiateOutFileName returns false for an invalid path (e.g., a directory),
-        // or if 'try' catches other filesystem errors.
-        std.process.exit(3);
-    }
-
-    // debug message
-    for (argv) |value| {
-        std.debug.print("{s}\n", .{value});
-    }
-
-    var app = App.init(gpa.allocator(), argv);
-    defer app.deinit();
-
-    // Start setting App-related fields.
-    for (argv, 0..) |value, i| {
-        switch (i) {
-            1 => app.specify_dir = value,
-            2 => app.output_file = value,
-            else => break,
-        }
-        std.debug.print("argv[{d}]: {s}\n", .{ i, value });
-    }
-
-    // 給使用者看的訊息 ++ 用法為串接字串
-    std.io.getStdOut().writer().print(
-        "🔧 Starting archive process...\n" ++
-            "📂 Directory to archive: {s}\n" ++
-            "📦 Output file path:     {s}\n",
-        .{ argv[1], argv[2] },
-    ) catch {
-        std.process.exit(2);
-    };
-
-    // 開始收集 用戶指定路徑的檔案列表
-    try app.collectFilesRecursively(app.specify_dir);
-
-    for (app.list.items) |item| {
-        std.debug.print("file name in list: {s}\n", .{item});
-    }
-
-    var env = try std.process.getEnvMap(app.allocator);
-    defer env.deinit();
-
-    try app.createTarArchive(argv[2]);
-}
-
 /// 驗證用戶提供的輸出路徑是否有效。
 ///
 /// 此函式檢查 `output_file_name`。
@@ -356,4 +287,75 @@ fn valiateOutFileName(output_file_name: []const u8) !bool {
         .file => return true,
         else => return false,
     }
+}
+
+/// 程式進入點。
+///
+/// 負責設定記憶體分配器、處理命令列參數、初始化 App 結構，
+/// 執行主要邏輯，並確保所有分配的資源都被正確釋放。
+pub fn main() !void {
+    // 先取得用戶的 argv
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+
+    // 取得用戶的 argv
+    const argv = try std.process.argsAlloc(gpa.allocator());
+    defer std.process.argsFree(gpa.allocator(), argv);
+
+    // 檢查參數數量
+    if (argv.len < 3) {
+        std.log.info("Usage: {s} <directory_to_archive> <output_file_path>", .{argv[0]});
+        return;
+    }
+
+    // Validate argv[2].
+    // valiateOutFileName returns false for an invalid path (e.g., a directory),
+    // or if 'try' catches other filesystem errors.
+    if (!try valiateOutFileName(argv[2])) {
+        std.process.exit(3);
+    }
+
+    // debug message
+    for (argv) |value| {
+        std.log.info("{s}", .{value});
+    }
+
+    var app = App.init(gpa.allocator(), argv);
+    defer app.deinit();
+
+    // Start setting App-related fields.
+    for (argv, 0..) |value, i| {
+        switch (i) {
+            1 => app.specify_dir = value,
+            2 => app.output_file = value,
+            else => break,
+        }
+        std.log.info("argv[{d}]: {s}", .{ i, value });
+    }
+
+    // 給使用者看的訊息 ++ 用法為串接字串
+    std.io.getStdOut().writer().print(
+        "🔧 Starting archive process...\n" ++
+            "📂 Directory to archive: {s}\n" ++
+            "📦 Output file path:     {s}\n",
+        .{ argv[1], argv[2] },
+    ) catch {
+        std.process.exit(2);
+    };
+
+    // 開始收集 用戶指定路徑的檔案列表
+    try app.collectFilesRecursively(app.specify_dir);
+
+    for (app.list.items) |item| {
+        std.log.info("file name in list: {s}", .{item});
+    }
+
+    var env = try std.process.getEnvMap(app.allocator);
+    defer env.deinit();
+
+    // const str1 = app.specify_dir[0 .. app.specify_dir.len - 1];
+    // const tgz_file_name = std.fs.path.joinZ(app.allocator, &.{str1});
+    // std.debug.print("\x1b[31mtgz file name:::: {s}\x1b[0m\n", .{tgz_file_name});
+
+    try app.createTarArchive(argv[2]);
 }
