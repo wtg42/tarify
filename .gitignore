@@ -2,3 +2,4 @@
 zig-out/
 *.o
 third_party/libarchive/
+GEMINI.md

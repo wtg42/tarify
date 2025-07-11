@@ -1,3 +1,5 @@
+/// MSE 專案打包 CLI app
+/// TODO: std.debug.print() 改成 自己包裝的 std.log + write file
 const std = @import("std");
 
 // 在 build.zig 裡面設定 libarchive
@@ -32,6 +34,7 @@ const App = struct {
     /// 解構並釋放 App 所使用的資源。
     ///
     /// 這會釋放儲存在列表中的所有字串，然後解構列表本身。
+    /// 這是必須要去一樣一樣釋放的
     pub fn deinit(self: *App) void {
         // Deallocate all the strings we duplicated.
         for (self.list.items) |item| {
@@ -114,7 +117,6 @@ const App = struct {
             }
 
             // 如果是檔案 (不是目錄)，則讀取其內容並寫入存檔
-            // if (st.kind == .File) {
             if ((st.st_mode & c.S_IFMT) == c.S_IFREG) {
                 var file = try std.fs.openFileAbsolute(
                     file_path_z,
@@ -161,8 +163,8 @@ const App = struct {
     /// 4. 將所有其他檔案的名稱（作為新分配的字串）加入到內部列表中。
     /// 5. 印出最終收集到的檔案名稱列表。
     pub fn collectFilesRecursively(self: *App, scan_path: []const u8) !void {
-        // Create a variable that specifies current directory path, including subdirectories.
-        // Use to build the full_path_file_name.
+        // Create a variable to hold the current scan path.
+        // This is used to build full paths for nested files.
         const base_path: []const u8 = try self.allocator.dupe(u8, scan_path);
         defer self.allocator.free(base_path);
 
@@ -214,7 +216,7 @@ const App = struct {
             }
 
             // 如果檔案是目錄，必須遞回掃描內部
-            // entry.name 就是只有 name 你必須自己傳入 base_path 來組合路徑
+            // entry.name is just the name; you must prepend base_path to form the full path.
             if (entry.kind == .directory) {
                 // 1. 忽略 '.' '..' 兩個目錄
                 if (std.mem.eql(u8, entry.name, ".") or std.mem.eql(u8, entry.name, "..")) {
@@ -231,11 +233,11 @@ const App = struct {
 
                 try self.collectFilesRecursively(new_path);
 
-                // Jump to next loop when self.run() is done.
+                // Continue to the next entry after the recursive call is done.
                 continue;
             }
 
-            // 遍歷 list 並印出所有收集到的檔案名稱
+            // 遍歷 list 並印出所有收集到的檔案名稱 之後改為 log 紀錄
             // Combine base_path and file name.
             // const full_path_file_name = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{
             //     base_path,
@@ -278,6 +280,13 @@ pub fn main() !void {
         return;
     }
 
+    // Validate argv[2].
+    if (!try valiateOutFileName(argv[2])) {
+        // valiateOutFileName returns false for an invalid path (e.g., a directory),
+        // or if 'try' catches other filesystem errors.
+        std.process.exit(3);
+    }
+
     // debug message
     for (argv) |value| {
         std.debug.print("{s}\n", .{value});
@@ -286,7 +295,7 @@ pub fn main() !void {
     var app = App.init(gpa.allocator(), argv);
     defer app.deinit();
 
-    // Start to set App-ralated fields.
+    // Start setting App-related fields.
     for (argv, 0..) |value, i| {
         switch (i) {
             1 => app.specify_dir = value,
@@ -296,14 +305,14 @@ pub fn main() !void {
         std.debug.print("argv[{d}]: {s}\n", .{ i, value });
     }
 
-    // 給使用者看的訊息 ++ 用法
+    // 給使用者看的訊息 ++ 用法為串接字串
     std.io.getStdOut().writer().print(
         "🔧 Starting archive process...\n" ++
             "📂 Directory to archive: {s}\n" ++
             "📦 Output file path:     {s}\n",
         .{ argv[1], argv[2] },
     ) catch {
-        std.process.exit(9);
+        std.process.exit(2);
     };
 
     // 開始收集 用戶指定路徑的檔案列表
@@ -319,9 +328,32 @@ pub fn main() !void {
     try app.createTarArchive(argv[2]);
 }
 
-/// 目前沒用到 可能會移除掉
-fn dumpEntry(entry: std.fs.Dir.Entry) void {
-    std.debug.print("Entry:\n", .{});
-    std.debug.print("  name: {s}\n", .{entry.name});
-    std.debug.print("  kind: {s}\n", .{@tagName(entry.kind)});
+/// 驗證用戶提供的輸出路徑是否有效。
+///
+/// 此函式檢查 `output_file_name`。
+/// - 如果路徑不存在，視為有效 (因為我們要建立新檔案)，回傳 `true`。
+/// - 如果路徑存在且為一個目錄，視為無效，回傳 `false`。
+/// - 如果路徑存在且為一個檔案，視為有效，回傳 `true`。
+/// - 如果在檢查路徑狀態時發生 `stat` 相關錯誤 (除了 `FileNotFound` 之外)，會將錯誤向上傳播。
+///
+/// @param output_file_name - 要驗證的輸出檔案路徑。
+/// @return - 如果路徑有效則為 `true`，如果路徑是個目錄則為 `false`，或是一個檔案系統錯誤。
+fn valiateOutFileName(output_file_name: []const u8) !bool {
+    const st = std.fs.cwd().statFile(output_file_name) catch |err| {
+        // 如果檔案或路徑不存在，這是可接受的，因為我們將要建立它。
+        if (err == error.FileNotFound) {
+            return true;
+        }
+        // 對於任何其他類型的錯誤，我們無法繼續，所以將錯誤拋出去。
+        std.log.err("無法驗證輸出路徑 '{s}': {any}", .{ output_file_name, err });
+        return err;
+    };
+
+    // 如果路徑存在，檢查它是否為一個目錄。
+    switch (st.kind) {
+        // 如果是檔案或其他類型，我們接受它。
+        // If it's a file or other type, we take it.
+        .file => return true,
+        else => return false,
+    }
 }
