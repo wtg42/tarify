@@ -257,6 +257,22 @@ const App = struct {
             try self.list.append(try self.allocator.dupe(u8, full_path_file_name));
         }
     }
+
+    /// This function allocates a new buffer\
+    /// that you must free by calling app.allocator.free(buffer).
+    pub fn createOutputFileNameAlloc(self: App) ![:0]const u8 {
+        // 用戶輸入的檔案名稱 跟專案資料夾同一個位置
+        const specify_dir_str = try self.allocator.dupeZ(u8, self.specify_dir);
+        defer self.allocator.free(specify_dir_str);
+        const tgz_file_name = try std.fs.path.joinZ(self.allocator, &.{ specify_dir_str, "patch.tgz" });
+
+        std.log.info(
+            "\x1b[34mOutput file name: {s}\x1b[0m\n",
+            .{tgz_file_name},
+        );
+
+        return tgz_file_name;
+    }
 };
 
 /// 驗證用戶提供的輸出路徑是否有效。
@@ -333,8 +349,21 @@ pub fn main() !void {
         std.log.info("argv[{d}]: {s}", .{ i, value });
     }
 
-    // 給使用者看的訊息 ++ 用法為串接字串
-    std.io.getStdOut().writer().print(
+    // 給使用者看的訊息 ++ 用法為串接字串 (舊寫法 deprecated)
+    // std.io.getStdOut().writer().print(
+    //     "🔧 Starting archive process...\n" ++
+    //         "📂 Directory to archive: {s}\n" ++
+    //         "📦 Output file path:     {s}\n",
+    //     .{ argv[1], argv[2] },
+    // ) catch {
+    //     std.process.exit(2);
+    // };
+
+    // 給使用者看的訊息 ++ 用法為串接字串 (0.15 新寫法 Writergate)
+    var buffer: [256]u8 = undefined;
+    const stdout = std.fs.File.stdout().writer(&buffer);
+    var writer_interface = stdout.interface;
+    writer_interface.print(
         "🔧 Starting archive process...\n" ++
             "📂 Directory to archive: {s}\n" ++
             "📦 Output file path:     {s}\n",
@@ -350,12 +379,20 @@ pub fn main() !void {
         std.log.info("file name in list: {s}", .{item});
     }
 
-    var env = try std.process.getEnvMap(app.allocator);
-    defer env.deinit();
+    // patch.tgz 跟專案資料夾同一個位置 之後會跟 INSTALL.sh 一起打包
+    const tgz_file_name = try app.createOutputFileNameAlloc();
+    defer app.allocator.free(tgz_file_name);
 
-    // const str1 = app.specify_dir[0 .. app.specify_dir.len - 1];
-    // const tgz_file_name = std.fs.path.joinZ(app.allocator, &.{str1});
-    // std.debug.print("\x1b[31mtgz file name:::: {s}\x1b[0m\n", .{tgz_file_name});
+    // source code archive
+    try app.createTarArchive(tgz_file_name);
 
-    try app.createTarArchive(argv[2]);
+    var files = std.fs.openFileAbsoluteZ(tgz_file_name, .{
+        .mode = .read_only,
+    }) catch |err| {
+        if (err == error.FileNotFound) {
+            std.debug.panic("unexpected error: {}\n", .{err});
+        }
+        return err;
+    };
+    defer files.close();
 }
