@@ -1,5 +1,7 @@
 /// MSE 專案打包 CLI app
 /// TODO: 包裝一個可以把 log 寫到特定 file 的 fn
+/// TODO: 第一層的迴圈需要忽略掉所有檔案 除了 INSTALL.sh 以外
+/// TODO: 在搬移 INSTALL.sh 檔案不在會爆炸 改用印出錯誤方式跳出
 const std = @import("std");
 
 // 在 build.zig 裡面設定 libarchive
@@ -18,7 +20,7 @@ const App = struct {
     // 打包指定的名稱 例如 project_6244_a1.tgz
     output_file: [:0]u8,
 
-    const sourceCodeArchive = "patch.tgz";
+    pub const source_code_archive_name = "patch.tgz";
 
     /// 初始化 App 結構。
     ///
@@ -149,7 +151,10 @@ const App = struct {
             }
         }
 
-        std.log.info("Successfully created tar archive: '{s}'", .{out_filename});
+        std.log.info(
+            "\x1b[34mSuccessfully created tar archive: '{s}'\x1b[0m",
+            .{out_filename},
+        );
     }
 
     /// 執行應用程式的主要邏輯。
@@ -258,13 +263,18 @@ const App = struct {
         }
     }
 
+    /// 輸出 source code 打包的檔名
+    ///
     /// This function allocates a new buffer\
     /// that you must free by calling app.allocator.free(buffer).
-    pub fn createOutputFileNameAlloc(self: App) ![:0]const u8 {
+    pub fn createSourceCodeFileNameAlloc(self: App) ![:0]const u8 {
         // 用戶輸入的檔案名稱 跟專案資料夾同一個位置
         const specify_dir_str = try self.allocator.dupeZ(u8, self.specify_dir);
         defer self.allocator.free(specify_dir_str);
-        const tgz_file_name = try std.fs.path.joinZ(self.allocator, &.{ specify_dir_str, "patch.tgz" });
+        const tgz_file_name = try std.fs.path.joinZ(
+            self.allocator,
+            &.{ specify_dir_str, source_code_archive_name },
+        );
 
         std.log.info(
             "\x1b[34mOutput file name: {s}\x1b[0m\n",
@@ -328,7 +338,7 @@ pub fn main() !void {
     // valiateOutFileName returns false for an invalid path (e.g., a directory),
     // or if 'try' catches other filesystem errors.
     if (!try valiateOutFileName(argv[2])) {
-        std.process.exit(3);
+        std.process.exit(2);
     }
 
     // debug message
@@ -350,6 +360,7 @@ pub fn main() !void {
     }
 
     // 給使用者看的訊息 ++ 用法為串接字串 (舊寫法 deprecated)
+    // 用來跟下方新寫法做比較
     // std.io.getStdOut().writer().print(
     //     "🔧 Starting archive process...\n" ++
     //         "📂 Directory to archive: {s}\n" ++
@@ -360,6 +371,9 @@ pub fn main() !void {
     // };
 
     // 給使用者看的訊息 ++ 用法為串接字串 (0.15 新寫法 Writergate)
+    // 需要先自定義 buffer 的 stdout writer
+    // 最後使用 interface.print() 來進行格式化輸出
+    // 非格式化輸出可以直接使用 std.fs.File.stdout().writeAll();
     var buffer: [256]u8 = undefined;
     const stdout = std.fs.File.stdout().writer(&buffer);
     var writer_interface = stdout.interface;
@@ -369,7 +383,7 @@ pub fn main() !void {
             "📦 Output file path:     {s}\n",
         .{ argv[1], argv[2] },
     ) catch {
-        std.process.exit(2);
+        std.process.exit(3);
     };
 
     // 開始收集 用戶指定路徑的檔案列表
@@ -380,7 +394,7 @@ pub fn main() !void {
     }
 
     // patch.tgz 跟專案資料夾同一個位置 之後會跟 INSTALL.sh 一起打包
-    const tgz_file_name = try app.createOutputFileNameAlloc();
+    const tgz_file_name = try app.createSourceCodeFileNameAlloc();
     defer app.allocator.free(tgz_file_name);
 
     // source code archive
@@ -395,4 +409,118 @@ pub fn main() !void {
         return err;
     };
     defer files.close();
+
+    const output_file_dir = try std.fs.path.join(
+        app.allocator,
+        &.{ app.specify_dir, app.output_file },
+    );
+    defer app.allocator.free(output_file_dir);
+
+    std.log.info("🛠️\x1b[34m建立資料打包所需的檔案 {s}\x1b[0m", .{output_file_dir});
+
+    // 預先刪除等等會用到的路徑
+    std.fs.deleteTreeAbsolute(output_file_dir) catch |err| {
+        switch (err) {
+            // 處理我們預期且可以從中恢復的特定錯誤
+            error.NotDir => {
+                // 這表示它可能是一個檔案，嘗試刪除檔案
+                std.fs.deleteFileAbsolute(output_file_dir) catch |file_err| {
+                    // 如果刪除檔案也失敗，記錄下來
+                    std.log.err("💀\x1b[31m嘗試將 '{s}' 作為檔案刪除失敗: {any}\x1b[0m", .{ output_file_dir, file_err });
+                    return;
+                };
+            },
+            // 對於一個我們預期可能發生的非致命錯誤，可以選擇忽略
+            error.FileNotFound => {
+                // 目標路徑本來就不存在，這很好，我們不需要做任何事。
+                std.log.info("'{s}' 本來就不存在，無需刪除。", .{output_file_dir});
+            },
+            else => {
+                // 對於所有其他非預期的錯誤，最好是記錄下來，讓開發者知道
+                std.log.err("💀\x1b[31m刪除 '{s}' 時發生非預期錯誤: {any}\x1b[0m", .{ output_file_dir, err });
+                return;
+            },
+        }
+    };
+
+    // patch.tgz 成功後可以開始建立 給用戶的資料夾來打包
+    std.fs.cwd().makeDir(output_file_dir) catch |err| {
+        std.debug.print(
+            "\x1b[31m{s}創建失敗: {}\x1b[0m",
+            .{ output_file_dir, err },
+        );
+
+        return;
+    };
+
+    // 新增 patch.tgz destination 路徑
+    const new_sub_path_source_code = try std.fs.path.join(
+        app.allocator,
+        &.{ output_file_dir, App.source_code_archive_name },
+    );
+    defer app.allocator.free(new_sub_path_source_code);
+
+    const old_sub_path_source_code = try std.fs.path.join(
+        app.allocator,
+        &.{ app.specify_dir, App.source_code_archive_name },
+    );
+    defer app.allocator.free(old_sub_path_source_code);
+
+    // 新增 INSTALL.sh destination 路徑
+    const new_sub_path_script = try std.fs.path.join(
+        app.allocator,
+        &.{ output_file_dir, "INSTALL.sh" },
+    );
+    defer app.allocator.free(new_sub_path_script);
+
+    const old_sub_path_script = try std.fs.path.join(
+        app.allocator,
+        &.{ app.specify_dir, "INSTALL.sh" },
+    );
+    defer app.allocator.free(old_sub_path_script);
+
+    // 嘗試移動 patch.tgz, INSTALL.sh 到打包資料夾
+    std.fs.cwd().rename(
+        old_sub_path_source_code,
+        new_sub_path_source_code,
+    ) catch |err| {
+        std.log.err("\x1b[31mFailed to rename patch.tgz: {}\x1b[0m", .{err});
+        std.process.exit(4);
+    };
+
+    std.fs.cwd().rename(
+        old_sub_path_script,
+        new_sub_path_script,
+    ) catch |err| {
+        std.log.err("\x1b[31mFailed to rename INSTALL.sh: {}\x1b[0m", .{err});
+        std.process.exit(5);
+    };
+
+    std.debug.print(
+        "{s}<====>{s}\n",
+        .{ app.specify_dir, output_file_dir },
+    );
+
+    // 在一次打包新創的這個目錄
+    const final_output_file = try std.fmt.allocPrint(
+        app.allocator,
+        "{s}{s}",
+        .{ output_file_dir, ".tgz" },
+    );
+    defer app.allocator.free(final_output_file);
+
+    // 再做一次 dupeZ 改成 C-style null-terminated string
+    const final_output_file_z = try app.allocator.dupeZ(
+        u8,
+        final_output_file,
+    );
+    defer app.allocator.free(final_output_file_z);
+
+    std.log.info(
+        "\x1b[34mHere's the file we're outputting {s}\x1b[0m",
+        .{final_output_file_z},
+    );
+
+    // 最後輸出
+    try app.createTarArchive(final_output_file_z);
 }
