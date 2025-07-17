@@ -283,7 +283,63 @@ const App = struct {
 
         return tgz_file_name;
     }
+
+    /// TODO: 修改 INSTALL.sh 備份部分 改為用戶要修改的清單
+    pub fn modifyInstallScript(self: App) !void {
+        const install_script_filename = try std.fmt.allocPrint(
+            self.allocator,
+            "{s}/{s}",
+            .{ self.specify_dir, "INSTALL.sh" },
+        );
+        defer self.allocator.free(install_script_filename);
+
+        std.debug.print("\x1b[31m111111::{s}\x1b[0m\n", .{install_script_filename});
+
+        const script_file = std.fs.openFileAbsolute(
+            install_script_filename,
+            .{ .mode = .read_only },
+        ) catch |err| {
+            std.log.err("\x1b[31mFailed to open file: {} \x1b[0m", .{err});
+
+            // 無法修改就不用再做下去了
+            std.process.exit(6);
+        };
+        defer script_file.close();
+
+        const file_stat = try script_file.stat();
+
+        std.debug.print("3333333=>{}", .{file_stat});
+
+        const content = try script_file.readToEndAlloc(
+            self.allocator,
+            file_stat.size,
+        );
+        defer self.allocator.free(content);
+
+        // 取出換行符號
+        const newline = detectNewline(content);
+
+        // 把文章內容利用換行符號一行一行讀取
+        var it = std.mem.splitSequence(u8, content, newline);
+        while (it.next()) |value| {
+            std.debug.print("value--->{s}\n", .{value});
+            // TODO: 比對 web update 範圍之後的部分全部都刪除
+            // TODO: 額外實作寫入樣板把需要備份的檔案放進樣板後寫入 INSTALL.sh
+            // TODO: 備份 specify_dir 內的資料夾跟檔案(使用 --ignore-failed-read 忽略不存在的檔案)
+        }
+
+        // Just temporary
+        std.process.exit(77);
+    }
 };
+
+/// 用來檢查檔案內容的換行符號屬於哪一類
+fn detectNewline(data: []const u8) []const u8 {
+    if (std.mem.indexOf(u8, data, "\r\n") != null) return "\r\n";
+    if (std.mem.indexOf(u8, data, "\n") != null) return "\n";
+    if (std.mem.indexOf(u8, data, "\r") != null) return "\r";
+    return "\n";
+}
 
 /// 驗證用戶提供的輸出路徑是否有效。
 ///
@@ -443,9 +499,12 @@ pub fn main() !void {
         }
     };
 
+    // TODO: 修改 INSTALL.sh 內容
+    try app.modifyInstallScript();
+
     // patch.tgz 成功後可以開始建立 給用戶的資料夾來打包
     std.fs.cwd().makeDir(output_file_dir) catch |err| {
-        std.debug.print(
+        std.log.err(
             "\x1b[31m{s}創建失敗: {}\x1b[0m",
             .{ output_file_dir, err },
         );
@@ -495,11 +554,6 @@ pub fn main() !void {
         std.log.err("\x1b[31mFailed to rename INSTALL.sh: {}\x1b[0m", .{err});
         std.process.exit(5);
     };
-
-    std.debug.print(
-        "{s}<====>{s}\n",
-        .{ app.specify_dir, output_file_dir },
-    );
 
     // 在一次打包新創的這個目錄
     const final_output_file = try std.fmt.allocPrint(
