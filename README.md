@@ -40,3 +40,12 @@ brew install libarchive
     ```bash
     sudo apk add libarchive-dev
     ```
+
+## Development
+
+- Zig: develop against nightly/master. Run `zig version` to confirm.
+- Tests & scripts: all local/CI test commands are centrally managed under `scripts/` or Makefile targets for consistency.
+  - Examples (conventions; scripts will live under `scripts/`):
+    - `make test` or `scripts/test_all.sh` → runs `zig build test`
+    - `make fmt` or `scripts/fmt.sh` → runs `zig fmt .`
+  - Shell scripts should use `#!/usr/bin/env bash` and `set -euo pipefail`.

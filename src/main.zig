@@ -3,6 +3,8 @@
 /// TODO: 第一層的迴圈需要忽略掉所有檔案 除了 INSTALL.sh 以外
 /// TODO: 在搬移 INSTALL.sh 檔案不在會爆炸 改用印出錯誤方式跳出
 const std = @import("std");
+const install_script = @import("install_script.zig");
+const cli_validate = @import("cli_validate.zig");
 
 // 在 build.zig 裡面設定 libarchive
 const c = @cImport({
@@ -31,7 +33,8 @@ const App = struct {
         return App{
             .allocator = allocator,
             .argv = argv,
-            .list = std.ArrayList([]const u8).init(allocator),
+            // ArrayList no longer stores allocator; use zero-init and pass allocator per call
+            .list = .{},
             .specify_dir = argv[1],
             .output_file = argv[2],
         };
@@ -46,7 +49,7 @@ const App = struct {
         for (self.list.items) |item| {
             self.allocator.free(item);
         }
-        self.list.deinit();
+        self.list.deinit(self.allocator);
     }
 
     /// 使用 libarchive 建立一個 tgz 存檔。
@@ -259,7 +262,7 @@ const App = struct {
             defer self.allocator.free(full_path_file_name);
 
             // 最後把需要的處理的檔名加進去
-            try self.list.append(try self.allocator.dupe(u8, full_path_file_name));
+            try self.list.append(self.allocator, try self.allocator.dupe(u8, full_path_file_name));
         }
     }
 
@@ -577,4 +580,187 @@ pub fn main() !void {
 
     // 最後輸出
     try app.createTarArchive(final_output_file_z);
+}
+
+test "main: detectNewline variants" {
+    // Use local GPA for precise allocation control
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+
+    // CRLF preferred when present
+    try std.testing.expect(std.mem.eql(u8, detectNewline("a\r\nb"), "\r\n"));
+    // LF
+    try std.testing.expect(std.mem.eql(u8, detectNewline("a\nb"), "\n"));
+    // CR
+    try std.testing.expect(std.mem.eql(u8, detectNewline("a\rb"), "\r"));
+    // Empty defaults to \n
+    try std.testing.expect(std.mem.eql(u8, detectNewline(""), "\n"));
+}
+
+test "main: valiateOutFileName for non-existent, file, and dir" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const alloc = gpa.allocator();
+
+    // Create isolated temp directory
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Absolute path of temp dir
+    const root_abs = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(root_abs);
+
+    // Non-existent path -> true
+    const missing = try std.fs.path.join(alloc, &.{ root_abs, "missing.file" });
+    defer alloc.free(missing);
+    try std.testing.expect(try valiateOutFileName(missing));
+
+    // Create a regular file -> true
+    {
+        var f = try tmp.dir.createFile("afile.txt", .{});
+        defer f.close();
+    }
+    const afile = try std.fs.path.join(alloc, &.{ root_abs, "afile.txt" });
+    defer alloc.free(afile);
+    try std.testing.expect(try valiateOutFileName(afile));
+
+    // Create a subdirectory -> false
+    try tmp.dir.makeDir("adir");
+    const adir = try std.fs.path.join(alloc, &.{ root_abs, "adir" });
+    defer alloc.free(adir);
+    try std.testing.expect(!(try valiateOutFileName(adir)));
+}
+
+test "main: collectFilesRecursively ignores INSTALL.sh and removes .tgz" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const alloc = gpa.allocator();
+
+    // Temp directory layout:
+    // root/
+    //   INSTALL.sh      (should be ignored)
+    //   old.tgz         (should be deleted)
+    //   a.txt           (should be collected)
+    //   nested/inner.txt(should be collected)
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_abs = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(root_abs);
+
+    // Create files
+    // INSTALL.sh
+    {
+        var f = try tmp.dir.createFile("INSTALL.sh", .{});
+        defer f.close();
+        try f.writeAll("echo hi\n");
+    }
+    // old.tgz
+    {
+        var f = try tmp.dir.createFile("old.tgz", .{});
+        defer f.close();
+        try f.writeAll("tgz");
+    }
+    // a.txt
+    {
+        var f = try tmp.dir.createFile("a.txt", .{});
+        defer f.close();
+        try f.writeAll("A");
+    }
+    // nested/inner.txt
+    try tmp.dir.makeDir("nested");
+    {
+        var nf = try tmp.dir.createFile("nested/inner.txt", .{});
+        defer nf.close();
+        try nf.writeAll("I");
+    }
+
+    // Prepare App instance
+    const argv0 = try alloc.dupeZ(u8, "tarify");
+    defer alloc.free(argv0);
+    const arg_dir = try alloc.dupeZ(u8, root_abs);
+    defer alloc.free(arg_dir);
+    const arg_out = try alloc.dupeZ(u8, "out");
+    defer alloc.free(arg_out);
+    const argv: []const [:0]u8 = &.{ argv0, arg_dir, arg_out };
+
+    var app = App.init(alloc, argv);
+    defer app.deinit();
+
+    // Run collection on the absolute temp root
+    try app.collectFilesRecursively(root_abs);
+
+    // old.tgz should be removed
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile("old.tgz"));
+
+    // Build expected absolute paths
+    const p_a = try std.fs.path.join(alloc, &.{ root_abs, "a.txt" });
+    defer alloc.free(p_a);
+    const p_inner = try std.fs.path.join(alloc, &.{ root_abs, "nested", "inner.txt" });
+    defer alloc.free(p_inner);
+
+    // Helper to check membership
+    var has_a = false;
+    var has_inner = false;
+    var has_install = false;
+    for (app.list.items) |it| {
+        if (std.mem.eql(u8, it, p_a)) has_a = true;
+        if (std.mem.eql(u8, it, p_inner)) has_inner = true;
+        if (std.mem.endsWith(u8, it, "INSTALL.sh")) has_install = true;
+    }
+    try std.testing.expect(has_a);
+    try std.testing.expect(has_inner);
+    try std.testing.expect(!has_install);
+}
+
+test "install: modifyInstallScriptContent injects backup list and truncates" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const alloc = gpa.allocator();
+
+    const nl = "\n";
+    const original = "#!/bin/sh" ++ nl ++
+        "echo before" ++ nl ++
+        "# WEB UPDATE START" ++ nl ++
+        "TO_BE_REPLACED" ++ nl ++
+        "echo after (should be gone)" ++ nl;
+
+    const opts = install_script.ModifyOptions{
+        .backup_list = &.{ "conf/app.yaml", "bin/start.sh", "var/data" },
+        .newline = nl,
+    };
+
+    const output = try install_script.modifyInstallScriptContent(alloc, original, opts);
+    defer alloc.free(output);
+
+    // Expectations (will fail with stub):
+    // - generated content should contain each backup path
+    // - previous payload token should be removed
+    try std.testing.expect(std.mem.indexOf(u8, output, "conf/app.yaml") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "bin/start.sh") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "var/data") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "TO_BE_REPLACED") == null);
+}
+
+test "cli: validateArgs rejects directory as output path" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const alloc = gpa.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const dir_abs = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(dir_abs);
+
+    const argv0 = try alloc.dupeZ(u8, "tarify");
+    defer alloc.free(argv0);
+    const arg_dir = try alloc.dupeZ(u8, dir_abs);
+    defer alloc.free(arg_dir);
+    const arg_out = try alloc.dupeZ(u8, dir_abs); // pass a directory intentionally
+    defer alloc.free(arg_out);
+    const argv: []const [:0]u8 = &.{ argv0, arg_dir, arg_out };
+
+    // Expect a dedicated error when output is a directory
+    try std.testing.expectError(error.OutIsDirectory, cli_validate.validateArgs(alloc, argv));
 }

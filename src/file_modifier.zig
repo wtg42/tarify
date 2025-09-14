@@ -47,21 +47,21 @@ pub const FileModifier = struct {
     /// Returns a new buffer with the modified content.
     /// The caller is responsible for freeing the returned buffer using `self.allocator.free()`.
     pub fn delete_text(self: FileModifier, original_content: []const u8, text_to_delete: []const u8) ![]u8 {
-        var list = std.ArrayList(u8).init(self.allocator);
-        defer list.deinit();
+        var list = std.ArrayList(u8){};
+        defer list.deinit(self.allocator);
 
         var current_pos: usize = 0;
         while (current_pos < original_content.len) {
             const found_index = std.mem.indexOf(u8, original_content[current_pos..], text_to_delete);
             if (found_index) |idx| {
-                try list.appendSlice(original_content[current_pos .. current_pos + idx]);
+                try list.appendSlice(self.allocator, original_content[current_pos .. current_pos + idx]);
                 current_pos += idx + text_to_delete.len;
             } else {
-                try list.appendSlice(original_content[current_pos..]);
+                try list.appendSlice(self.allocator, original_content[current_pos..]);
                 current_pos = original_content.len;
             }
         }
-        return list.toOwnedSlice();
+        return list.toOwnedSlice(self.allocator);
     }
 
     /// Inserts `text_to_insert` at the specified `line_number` (1-based) in `original_content`.
@@ -72,8 +72,8 @@ pub const FileModifier = struct {
             return error.InvalidLineNumber;
         }
 
-        var list = std.ArrayList(u8).init(self.allocator);
-        defer list.deinit();
+        var list = std.ArrayList(u8){};
+        defer list.deinit(self.allocator);
 
         var fbs = std.io.fixedBufferStream(original_content);
         var line_stream = std.io.bufferedReader(fbs.reader());
@@ -82,9 +82,9 @@ pub const FileModifier = struct {
         var current_line: usize = 1;
         while (true) {
             if (current_line == line_number) {
-                try list.appendSlice(text_to_insert);
+                try list.appendSlice(self.allocator, text_to_insert);
                 if (text_to_insert.len > 0 and text_to_insert[text_to_insert.len - 1] != '\n') {
-                    try list.append('\n'); // Ensure newline after inserted text
+                    try list.append(self.allocator, '\n'); // Ensure newline after inserted text
                 }
             }
 
@@ -95,14 +95,14 @@ pub const FileModifier = struct {
             };
 
             if (line.len > 0) {
-                try list.appendSlice(line);
+                try list.appendSlice(self.allocator, line);
                 if (line_reader.buffer.peek(1) catch null == '\n') { // Check if newline was consumed
                     _ = line_reader.readByte() catch {}; // Consume the newline
-                    try list.append('\n');
+                    try list.append(self.allocator, '\n');
                 }
             } else if (line_reader.buffer.peek(1) catch null == '\n') { // Handle empty lines
                 _ = line_reader.readByte() catch {};
-                try list.appendByte('\n');
+                try list.appendByte(self.allocator, '\n');
             }
 
             current_line += 1;
@@ -110,13 +110,13 @@ pub const FileModifier = struct {
 
         // If line_number is beyond the end of the file, append at the end
         if (line_number >= current_line) {
-            try list.appendSlice(text_to_insert);
+            try list.appendSlice(self.allocator, text_to_insert);
             if (text_to_insert.len > 0 and text_to_insert[text_to_insert.len - 1] != '\n') {
-                try list.appendByte('\n');
+                try list.appendByte(self.allocator, '\n');
             }
         }
 
-        return list.toOwnedSlice();
+        return list.toOwnedSlice(self.allocator);
     }
 
     /// Saves the `modified_content` to `original_file_path` or `new_file_path`.

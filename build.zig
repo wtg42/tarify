@@ -138,6 +138,11 @@ pub fn build(b: *std.Build) void {
         .root_module = exe.root_module,
     });
 
+    // Ensure tests for main.zig (which uses @cImport for libarchive) can compile/link
+    exe_tests.addIncludePath(b.path("third_party/libarchive/libarchive"));
+    exe_tests.linkSystemLibrary("archive");
+    exe_tests.linkLibC();
+
     // A run step that will run the second test executable.
     const run_exe_tests = b.addRunArtifact(exe_tests);
 
